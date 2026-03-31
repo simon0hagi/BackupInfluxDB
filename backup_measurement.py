@@ -4,6 +4,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from influxdb import InfluxDBClient
 from influxdb.exceptions import InfluxDBClientError, InfluxDBServerError
+from dotenv import load_dotenv
 
 def parse_iso_time(time_str):
     # Handle 'Z' suffix for UTC which fromisoformat might not handle in older Pythons
@@ -19,12 +20,16 @@ def get_env_or_die(var_name):
     return val
 
 def main():
+    # Load configuration from .env file
+    load_dotenv()
+
     # Read environment variables
     host = os.environ.get('INFLUXDB_HOST', 'localhost')
     port = int(os.environ.get('INFLUXDB_PORT', '8086'))
     user = os.environ.get('INFLUXDB_USER', '')
     password = os.environ.get('INFLUXDB_PASSWORD', '')
     database = get_env_or_die('INFLUXDB_DATABASE')
+    target_database = os.environ.get('TARGET_DATABASE', database)
 
     source_measurement = get_env_or_die('SOURCE_MEASUREMENT')
     target_measurement = get_env_or_die('TARGET_MEASUREMENT')
@@ -58,18 +63,26 @@ def main():
         # Test connection
         client.ping()
         print("Successfully connected to InfluxDB.")
+
+        # Verify target database exists if it's different
+        if target_database != database:
+            dbs = client.get_list_database()
+            if not any(db['name'] == target_database for db in dbs):
+                print(f"Target database '{target_database}' does not exist. Please create it first.")
+                sys.exit(1)
     except Exception as e:
-        print(f"Failed to connect to InfluxDB: {e}")
+        print(f"Failed to connect to InfluxDB or verify databases: {e}")
         sys.exit(1)
 
-    print(f"Copying data from '{source_measurement}' to '{target_measurement}'")
+    print(f"Copying data from '{database}'.'{source_measurement}' to '{target_database}'.'{target_measurement}'")
     print(f"Time range: {start_time.isoformat()} to {end_time.isoformat()}")
     print(f"Chunk interval: {chunk_interval_minutes} minute(s)")
 
+    import math
     current_time = start_time
     chunk_delta = timedelta(minutes=chunk_interval_minutes)
 
-    total_chunks = int(((end_time - start_time).total_seconds() / 60.0) / chunk_interval_minutes)
+    total_chunks = math.ceil(((end_time - start_time).total_seconds() / 60.0) / chunk_interval_minutes)
     if total_chunks == 0:
         total_chunks = 1
 
@@ -86,7 +99,12 @@ def main():
         t1 = current_time.isoformat().replace('+00:00', 'Z')
         t2 = next_time.isoformat().replace('+00:00', 'Z')
 
-        query = f'SELECT * INTO "{target_measurement}" FROM "{source_measurement}" WHERE time >= \'{t1}\' AND time < \'{t2}\' GROUP BY *'
+        # Fully qualify target measurement to allow cross-database copying.
+        # Format: "database"."retention_policy"."measurement"
+        # We leave the retention policy empty to use the database's default retention policy.
+        qualified_target = f'"{target_database}".."{target_measurement}"'
+
+        query = f'SELECT * INTO {qualified_target} FROM "{source_measurement}" WHERE time >= \'{t1}\' AND time < \'{t2}\' GROUP BY *'
 
         chunk_count += 1
         print(f"[{chunk_count}/{total_chunks}] Executing query for range: {t1} -> {t2}")
