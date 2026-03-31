@@ -39,6 +39,24 @@ Configuration is managed via a `.env` file in the project directory. This approa
    - `INFLUXDB_USER`: Username for InfluxDB authentication (Default: empty).
    - `INFLUXDB_PASSWORD`: Password for InfluxDB authentication (Default: empty).
    - `CHUNK_INTERVAL_MINUTES`: How many minutes of data to copy per database query (Default: `1`).
+   - `MAX_CONCURRENT_QUERIES`: The number of chunk queries to send to InfluxDB simultaneously. (Default: `2`).
+   - `MAX_CHUNKS_PER_RUN`: The maximum number of chunks to process in a single execution. Useful for splitting backups into sections (Default: empty, runs until `END_TIME`).
+
+## Speeding up the Backup
+
+If you find the backup process is too slow on large datasets, try the following optimizations in your `.env` file:
+1. **Increase `MAX_CONCURRENT_QUERIES`**: This uses asynchronous thread pooling to send multiple chunk requests to InfluxDB at the same time. Try bumping it from `2` to `4` or `8`. Monitor your InfluxDB server's CPU and RAM to ensure it is not getting overwhelmed.
+2. **Increase `CHUNK_INTERVAL_MINUTES`**: Setting the chunk size to 1 minute means the script spends a significant amount of time just setting up HTTP requests for tiny slivers of data. Try increasing this to `10`, `60` (1 hour), or even `1440` (1 day) so InfluxDB can optimize larger disk reads.
+
+## Pausing and Resuming
+
+The script is fully resilient to interruptions and supports pausing:
+
+- **Manual Pausing:** You can press `Ctrl+C` at any time while the script is running. It will finish the current chunk, save its progress to a local `.backup_state.json` file, and gracefully exit.
+- **Sectioned Runs:** By configuring `MAX_CHUNKS_PER_RUN` in your `.env` file, the script will process a specific number of chunks and automatically pause, saving its state.
+- **Resuming:** Whenever you run `python backup_measurement.py` again, the script will automatically detect the `.backup_state.json` file and seamlessly resume exactly where it left off, rather than starting from `START_TIME`.
+
+*(Note: The state file is automatically deleted once the backup reaches the `END_TIME`.)*
 
 ## Usage
 

@@ -2,7 +2,9 @@ import os
 import sys
 import time
 import math
+import json
 import logging
+import concurrent.futures
 from datetime import datetime, timedelta, timezone
 from influxdb import InfluxDBClient
 from influxdb.exceptions import InfluxDBClientError, InfluxDBServerError
@@ -40,13 +42,40 @@ def count_measurement_points(client, database, measurement, start_time, end_time
         result = client.query(query, method='GET')
         points = list(result.get_points())
         if points:
-            # The count function returns the count for all fields, we just grab the first one
-            first_field = list(points[0].keys())[-1]
-            return points[0][first_field]
+            # The count function returns the count for all fields, we grab the first non-time field
+            for key, value in points[0].items():
+                if key != 'time':
+                    return value
         return 0
     except Exception as e:
         logger.warning(f"Could not count points for '{database}'.'{measurement}': {e}")
         return None
+
+STATE_FILE = ".backup_state.json"
+
+def load_state():
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Could not read state file {STATE_FILE}: {e}")
+    return None
+
+def save_state(state_data):
+    try:
+        with open(STATE_FILE, 'w') as f:
+            json.dump(state_data, f, indent=4)
+    except Exception as e:
+        logger.warning(f"Could not save state to {STATE_FILE}: {e}")
+
+def clear_state():
+    if os.path.exists(STATE_FILE):
+        try:
+            os.remove(STATE_FILE)
+            logger.info("Cleared backup state file.")
+        except Exception as e:
+            logger.warning(f"Could not clear state file {STATE_FILE}: {e}")
 
 def main():
     # Load configuration from .env file
@@ -70,6 +99,22 @@ def main():
         chunk_interval_minutes = int(os.environ.get('CHUNK_INTERVAL_MINUTES', '1'))
     except ValueError:
         logger.error("CHUNK_INTERVAL_MINUTES must be an integer.")
+        sys.exit(1)
+
+    try:
+        max_workers_env = os.environ.get('MAX_CONCURRENT_QUERIES', '2')
+        max_concurrent_queries = int(max_workers_env)
+        if max_concurrent_queries < 1:
+            max_concurrent_queries = 1
+    except ValueError:
+        logger.error("MAX_CONCURRENT_QUERIES must be a positive integer.")
+        sys.exit(1)
+
+    try:
+        max_chunks_env = os.environ.get('MAX_CHUNKS_PER_RUN', '')
+        max_chunks_per_run = int(max_chunks_env) if max_chunks_env else None
+    except ValueError:
+        logger.error("MAX_CHUNKS_PER_RUN must be an integer.")
         sys.exit(1)
 
     try:
@@ -137,110 +182,177 @@ def main():
     else:
         logger.info("Could not determine point count. Proceeding anyway.")
 
+    # Check for existing state
     current_time = start_time
+    chunk_count = 0
+    total_points_written = 0
+
+    state = load_state()
+    if state:
+        # Verify the state matches our current config to avoid resuming a different backup
+        if (state.get('database') == database and
+            state.get('source_measurement') == source_measurement and
+            state.get('target_measurement') == target_measurement):
+
+            resume_time = parse_iso_time(state['current_time'])
+            if start_time <= resume_time < end_time:
+                logger.info(f"Resuming previous backup from {resume_time.isoformat()}...")
+                current_time = resume_time
+                chunk_count = state.get('chunk_count', 0)
+                total_points_written = state.get('total_points_written', 0)
+            else:
+                logger.info("Found state file, but its time is outside the current range. Starting fresh.")
+                clear_state()
+        else:
+            logger.info("Found state file for a different backup configuration. Starting fresh.")
+            clear_state()
+
     chunk_delta = timedelta(minutes=chunk_interval_minutes)
 
+    # Recalculate chunks based on the original start time so the percentage makes sense
     total_chunks = math.ceil(((end_time - start_time).total_seconds() / 60.0) / chunk_interval_minutes)
     if total_chunks == 0:
         total_chunks = 1
 
-    chunk_count = 0
-    total_points_written = 0
+    logger.info(f"Starting backup process. Total chunks in range: {total_chunks}")
+    logger.info(f"Concurrency level: {max_concurrent_queries} queries simultaneously.")
+    if max_chunks_per_run:
+        logger.info(f"Will process up to {max_chunks_per_run} chunks this run.")
 
-    logger.info(f"Starting backup process. Total chunks to process: {total_chunks}")
+    chunks_processed_this_run = 0
 
-    while current_time < end_time:
-        next_time = current_time + chunk_delta
-        if next_time > end_time:
-            next_time = end_time
-
-        # Format for InfluxDB WHERE clause (RFC3339)
-        # InfluxDB needs 'YYYY-MM-DDTHH:MM:SSZ' format or nanoseconds.
-        # By using isoformat(), we get a valid string, but let's replace +00:00 with Z for standard Influx compat
-        t1 = current_time.isoformat().replace('+00:00', 'Z')
-        t2 = next_time.isoformat().replace('+00:00', 'Z')
-
+    def process_chunk(t1_str, t2_str):
+        """Worker function to execute a single chunk query."""
         # Fully qualify target measurement to allow cross-database copying.
-        # Format: "database"."retention_policy"."measurement"
-        # We leave the retention policy empty to use the database's default retention policy.
         qualified_target = f'"{target_database}".."{target_measurement}"'
-
-        query = f'SELECT * INTO {qualified_target} FROM "{source_measurement}" WHERE time >= \'{t1}\' AND time < \'{t2}\' GROUP BY *'
-
-        chunk_count += 1
+        query = f'SELECT * INTO {qualified_target} FROM "{source_measurement}" WHERE time >= \'{t1_str}\' AND time < \'{t2_str}\' GROUP BY *'
 
         max_retries = 3
         retry_delay = 2 # seconds
-        success = False
-        points_in_chunk = 0
 
         for attempt in range(1, max_retries + 1):
             try:
                 # Execute the query (requires POST for INTO queries)
                 result = client.query(query, method='POST')
 
-                # InfluxDB SELECT INTO returns a single series with a "written" field
-                # e.g. [{'time': '1970-01-01T00:00:00Z', 'written': 150}]
+                # Extract written points count
                 written_points = list(result.get_points())
                 if written_points and 'written' in written_points[0]:
-                    points_in_chunk = written_points[0]['written']
-
-                total_points_written += points_in_chunk
-                success = True
-                break
+                    return written_points[0]['written']
+                return 0
             except (InfluxDBServerError, InfluxDBClientError) as e:
-                logger.warning(f"Attempt {attempt} failed: {e}")
+                logger.warning(f"Chunk {t1_str}->{t2_str} attempt {attempt} failed: {e}")
                 if attempt < max_retries:
-                    logger.info(f"Retrying in {retry_delay} seconds...")
                     time.sleep(retry_delay)
-                    retry_delay *= 2 # Exponential backoff
+                    retry_delay *= 2
             except Exception as e:
-                logger.error(f"Unexpected error during query execution: {e}")
+                logger.error(f"Unexpected error on chunk {t1_str}->{t2_str}: {e}")
                 if attempt < max_retries:
-                    logger.info(f"Retrying in {retry_delay} seconds...")
                     time.sleep(retry_delay)
-                    retry_delay *= 2 # Exponential backoff
+                    retry_delay *= 2
 
-        if not success:
-            logger.error(f"Failed to process chunk {t1} -> {t2} after {max_retries} attempts.")
-            logger.error("Aborting to ensure no data is missing. Please investigate and resume from this chunk.")
-            sys.exit(1)
+        logger.error(f"Failed to process chunk {t1_str} -> {t2_str} after {max_retries} attempts.")
+        raise RuntimeError(f"Chunk failure: {t1_str} -> {t2_str}")
 
-        # Log progress periodically (e.g. every 5% of chunks, or at least every 10 chunks if few chunks)
-        # Always log the first and last chunk
-        log_interval = max(1, int(total_chunks * 0.05))
-        if chunk_count == 1 or chunk_count == total_chunks or chunk_count % log_interval == 0:
-            percentage = (chunk_count / total_chunks) * 100
+    try:
+        # We process in batches equal to max_concurrent_queries.
+        # This keeps state saving robust—we only advance the state when a full batch is safely completed.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrent_queries) as executor:
+            while current_time < end_time:
+                if max_chunks_per_run and chunks_processed_this_run >= max_chunks_per_run:
+                    logger.info(f"Reached MAX_CHUNKS_PER_RUN limit of {max_chunks_per_run}. Pausing.")
+                    break
 
-            if initial_source_count is not None and initial_source_count > 0:
-                points_remaining = max(0, initial_source_count - total_points_written)
-                logger.info(f"Progress: [{chunk_count}/{total_chunks}] chunks ({percentage:.1f}%) | "
-                            f"Copied {total_points_written:,} points | Remaining: ~{points_remaining:,}")
+                # Prepare a batch of chunks
+                batch_tasks = []
+                batch_end_time = current_time
+
+                for _ in range(max_concurrent_queries):
+                    if batch_end_time >= end_time:
+                        break
+                    if max_chunks_per_run and (chunks_processed_this_run + len(batch_tasks)) >= max_chunks_per_run:
+                        break
+
+                    next_time = batch_end_time + chunk_delta
+                    if next_time > end_time:
+                        next_time = end_time
+
+                    t1 = batch_end_time.isoformat().replace('+00:00', 'Z')
+                    t2 = next_time.isoformat().replace('+00:00', 'Z')
+
+                    future = executor.submit(process_chunk, t1, t2)
+                    batch_tasks.append(future)
+                    batch_end_time = next_time
+
+                if not batch_tasks:
+                    break
+
+                # Wait for the current batch to finish
+                try:
+                    for future in concurrent.futures.as_completed(batch_tasks):
+                        points_in_chunk = future.result()
+                        total_points_written += points_in_chunk
+                        chunk_count += 1
+                        chunks_processed_this_run += 1
+                except RuntimeError as e:
+                    logger.error("Aborting backup due to chunk failure. Please investigate and resume from this timestamp.")
+                    sys.exit(1)
+
+                # Batch is complete. It is now safe to advance the master current_time and save state.
+                current_time = batch_end_time
+
+                # Log progress periodically
+                log_interval = max(1, int(total_chunks * 0.05))
+                if chunk_count == len(batch_tasks) or chunk_count == total_chunks or chunk_count % log_interval < max_concurrent_queries:
+                    percentage = (chunk_count / total_chunks) * 100
+
+                    if initial_source_count is not None and initial_source_count > 0:
+                        points_remaining = max(0, initial_source_count - total_points_written)
+                        logger.info(f"Progress: [{chunk_count}/{total_chunks}] chunks ({percentage:.1f}%) | "
+                                    f"Copied {total_points_written:,} points | Remaining: ~{points_remaining:,}")
+                    else:
+                        logger.info(f"Progress: [{chunk_count}/{total_chunks}] chunks ({percentage:.1f}%) | "
+                                    f"Copied {total_points_written:,} points")
+
+                # Save state after successful batch
+                save_state({
+                    'current_time': current_time.isoformat(),
+                    'chunk_count': chunk_count,
+                    'total_points_written': total_points_written,
+                    'database': database,
+                    'source_measurement': source_measurement,
+                    'target_measurement': target_measurement
+                })
+
+    except KeyboardInterrupt:
+        logger.info("\nReceived pause signal (Ctrl+C). Waiting for active queries in the current batch to finish, then exiting gracefully...")
+        # The context manager automatically waits for running futures to finish before exiting the block.
+        # We don't advance the state file, so the next run will correctly retry the interrupted batch.
+        sys.exit(0)
+
+    if current_time >= end_time:
+        logger.info("Backup process finished entirely!")
+        logger.info(f"Total points written across all chunks: {total_points_written:,}")
+        clear_state()
+
+        # Final verification
+        if initial_source_count is not None and initial_source_count > 0:
+            logger.info("Verifying copied data...")
+            final_target_count = count_measurement_points(client, target_database, target_measurement, start_time, end_time)
+
+            if final_target_count is not None:
+                logger.info("--- Final Summary ---")
+                logger.info(f"Source points counted: {initial_source_count:,}")
+                logger.info(f"Target points written: {final_target_count:,}")
+
+                if final_target_count >= initial_source_count:
+                    logger.info("Verification Successful: Target contains all expected points.")
+                else:
+                    logger.warning(f"Verification Mismatch: Target is missing {initial_source_count - final_target_count:,} points!")
             else:
-                logger.info(f"Progress: [{chunk_count}/{total_chunks}] chunks ({percentage:.1f}%) | "
-                            f"Copied {total_points_written:,} points")
-
-        current_time = next_time
-
-    logger.info("Backup process finished!")
-    logger.info(f"Total points written across all chunks: {total_points_written:,}")
-
-    # Final verification
-    if initial_source_count is not None and initial_source_count > 0:
-        logger.info("Verifying copied data...")
-        final_target_count = count_measurement_points(client, target_database, target_measurement, start_time, end_time)
-
-        if final_target_count is not None:
-            logger.info("--- Final Summary ---")
-            logger.info(f"Source points counted: {initial_source_count:,}")
-            logger.info(f"Target points written: {final_target_count:,}")
-
-            if final_target_count >= initial_source_count:
-                logger.info("Verification Successful: Target contains all expected points.")
-            else:
-                logger.warning(f"Verification Mismatch: Target is missing {initial_source_count - final_target_count:,} points!")
-        else:
-             logger.info("Data was copied, but could not automatically verify target point count.")
+                 logger.info("Data was copied, but could not automatically verify target point count.")
+    else:
+        logger.info(f"Backup paused at {current_time.isoformat()}. Run the script again to resume.")
 
 if __name__ == "__main__":
     main()
