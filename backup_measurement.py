@@ -1,10 +1,19 @@
 import os
 import sys
 import time
+import logging
 from datetime import datetime, timedelta, timezone
 from influxdb import InfluxDBClient
 from influxdb.exceptions import InfluxDBClientError, InfluxDBServerError
 from dotenv import load_dotenv
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
 def parse_iso_time(time_str):
     # Handle 'Z' suffix for UTC which fromisoformat might not handle in older Pythons
@@ -15,9 +24,28 @@ def parse_iso_time(time_str):
 def get_env_or_die(var_name):
     val = os.environ.get(var_name)
     if not val:
-        print(f"Error: Environment variable {var_name} is required.")
+        logger.error(f"Environment variable {var_name} is required in the .env file.")
         sys.exit(1)
     return val
+
+def count_measurement_points(client, database, measurement, start_time, end_time):
+    """Helper to count points in a measurement for a given time range."""
+    t1 = start_time.isoformat().replace('+00:00', 'Z')
+    t2 = end_time.isoformat().replace('+00:00', 'Z')
+
+    # We fully qualify the measurement to handle target database queries
+    query = f'SELECT COUNT(*) FROM "{database}".."{measurement}" WHERE time >= \'{t1}\' AND time < \'{t2}\''
+    try:
+        result = client.query(query, method='GET')
+        points = list(result.get_points())
+        if points:
+            # The count function returns the count for all fields, we just grab the first one
+            first_field = list(points[0].keys())[-1]
+            return points[0][first_field]
+        return 0
+    except Exception as e:
+        logger.warning(f"Could not count points for '{database}'.'{measurement}': {e}")
+        return None
 
 def main():
     # Load configuration from .env file
@@ -40,43 +68,59 @@ def main():
     try:
         chunk_interval_minutes = int(os.environ.get('CHUNK_INTERVAL_MINUTES', '1'))
     except ValueError:
-        print("Error: CHUNK_INTERVAL_MINUTES must be an integer.")
+        logger.error("CHUNK_INTERVAL_MINUTES must be an integer.")
         sys.exit(1)
 
     try:
         start_time = parse_iso_time(start_time_str)
         end_time = parse_iso_time(end_time_str)
     except ValueError as e:
-        print(f"Error parsing start or end time: {e}")
-        print("Expected format: YYYY-MM-DDTHH:MM:SSZ (e.g. 2023-01-01T00:00:00Z)")
+        logger.error(f"Error parsing start or end time: {e}")
+        logger.error("Expected format: YYYY-MM-DDTHH:MM:SSZ (e.g. 2023-01-01T00:00:00Z)")
         sys.exit(1)
 
     if start_time >= end_time:
-        print("Error: START_TIME must be before END_TIME.")
+        logger.error("START_TIME must be before END_TIME.")
         sys.exit(1)
 
     # Initialize InfluxDB Client
     client = InfluxDBClient(host=host, port=port, username=user, password=password, database=database)
 
-    print(f"Connecting to InfluxDB at {host}:{port}, database '{database}'...")
+    logger.info(f"Connecting to InfluxDB at {host}:{port}, database '{database}'...")
     try:
         # Test connection
         client.ping()
-        print("Successfully connected to InfluxDB.")
+        logger.info("Successfully connected to InfluxDB.")
 
         # Verify target database exists if it's different
         if target_database != database:
             dbs = client.get_list_database()
             if not any(db['name'] == target_database for db in dbs):
-                print(f"Target database '{target_database}' does not exist. Please create it first.")
+                logger.error(f"Target database '{target_database}' does not exist. Please create it first.")
                 sys.exit(1)
     except Exception as e:
-        print(f"Failed to connect to InfluxDB or verify databases: {e}")
+        logger.error(f"Failed to connect to InfluxDB or verify databases: {e}")
         sys.exit(1)
 
-    print(f"Copying data from '{database}'.'{source_measurement}' to '{target_database}'.'{target_measurement}'")
-    print(f"Time range: {start_time.isoformat()} to {end_time.isoformat()}")
-    print(f"Chunk interval: {chunk_interval_minutes} minute(s)")
+    logger.info("--- Configuration Summary ---")
+    logger.info(f"Source: Database '{database}', Measurement '{source_measurement}'")
+    logger.info(f"Target: Database '{target_database}', Measurement '{target_measurement}'")
+    logger.info(f"Time Range: {start_time.isoformat()} to {end_time.isoformat()}")
+    logger.info(f"Chunk Interval: {chunk_interval_minutes} minute(s)")
+    logger.info("-----------------------------")
+
+    # Analyze data before starting
+    logger.info("Analyzing source measurement data...")
+    initial_source_count = count_measurement_points(client, database, source_measurement, start_time, end_time)
+
+    if initial_source_count is not None:
+        if initial_source_count == 0:
+            logger.warning(f"No points found in the source measurement '{source_measurement}' for the specified time range. Exiting.")
+            sys.exit(0)
+        else:
+            logger.info(f"Found approximately {initial_source_count:,} points to copy.")
+    else:
+        logger.info("Could not determine point count. Proceeding anyway.")
 
     import math
     current_time = start_time
@@ -107,7 +151,8 @@ def main():
         query = f'SELECT * INTO {qualified_target} FROM "{source_measurement}" WHERE time >= \'{t1}\' AND time < \'{t2}\' GROUP BY *'
 
         chunk_count += 1
-        print(f"[{chunk_count}/{total_chunks}] Executing query for range: {t1} -> {t2}")
+        percentage = (chunk_count / total_chunks) * 100
+        logger.info(f"[{chunk_count}/{total_chunks}] ({percentage:.1f}%) Processing time range: {t1} -> {t2}")
 
         max_retries = 3
         retry_delay = 2 # seconds
@@ -120,26 +165,43 @@ def main():
                 success = True
                 break
             except (InfluxDBServerError, InfluxDBClientError) as e:
-                print(f"  Attempt {attempt} failed: {e}")
+                logger.warning(f"Attempt {attempt} failed: {e}")
                 if attempt < max_retries:
-                    print(f"  Retrying in {retry_delay} seconds...")
+                    logger.info(f"Retrying in {retry_delay} seconds...")
                     time.sleep(retry_delay)
                     retry_delay *= 2 # Exponential backoff
             except Exception as e:
-                print(f"  Unexpected error during query execution: {e}")
+                logger.error(f"Unexpected error during query execution: {e}")
                 if attempt < max_retries:
-                    print(f"  Retrying in {retry_delay} seconds...")
+                    logger.info(f"Retrying in {retry_delay} seconds...")
                     time.sleep(retry_delay)
                     retry_delay *= 2 # Exponential backoff
 
         if not success:
-            print(f"Failed to process chunk {t1} -> {t2} after {max_retries} attempts.")
-            print("Aborting to ensure no data is missing. Please investigate and resume from this chunk.")
+            logger.error(f"Failed to process chunk {t1} -> {t2} after {max_retries} attempts.")
+            logger.error("Aborting to ensure no data is missing. Please investigate and resume from this chunk.")
             sys.exit(1)
 
         current_time = next_time
 
-    print("\nBackup completed successfully!")
+    logger.info("Backup process finished!")
+
+    # Final verification
+    if initial_source_count is not None and initial_source_count > 0:
+        logger.info("Verifying copied data...")
+        final_target_count = count_measurement_points(client, target_database, target_measurement, start_time, end_time)
+
+        if final_target_count is not None:
+            logger.info("--- Final Summary ---")
+            logger.info(f"Source points counted: {initial_source_count:,}")
+            logger.info(f"Target points written: {final_target_count:,}")
+
+            if final_target_count >= initial_source_count:
+                logger.info("Verification Successful: Target contains all expected points.")
+            else:
+                logger.warning(f"Verification Mismatch: Target is missing {initial_source_count - final_target_count:,} points!")
+        else:
+             logger.info("Data was copied, but could not automatically verify target point count.")
 
 if __name__ == "__main__":
     main()
