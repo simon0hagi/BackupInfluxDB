@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import math
 import logging
 from datetime import datetime, timedelta, timezone
 from influxdb import InfluxDBClient
@@ -111,6 +112,20 @@ def main():
 
     # Analyze data before starting
     logger.info("Analyzing source measurement data...")
+
+    # Show an example line
+    example_query = f'SELECT * FROM "{database}".."{source_measurement}" LIMIT 1'
+    try:
+        example_result = client.query(example_query, method='GET')
+        points = list(example_result.get_points())
+        if points:
+            logger.info("Example data point from source:")
+            logger.info(points[0])
+        else:
+            logger.info("Source measurement is empty or has no data yet.")
+    except Exception as e:
+        logger.warning(f"Could not fetch example data point: {e}")
+
     initial_source_count = count_measurement_points(client, database, source_measurement, start_time, end_time)
 
     if initial_source_count is not None:
@@ -122,7 +137,6 @@ def main():
     else:
         logger.info("Could not determine point count. Proceeding anyway.")
 
-    import math
     current_time = start_time
     chunk_delta = timedelta(minutes=chunk_interval_minutes)
 
@@ -131,6 +145,9 @@ def main():
         total_chunks = 1
 
     chunk_count = 0
+    total_points_written = 0
+
+    logger.info(f"Starting backup process. Total chunks to process: {total_chunks}")
 
     while current_time < end_time:
         next_time = current_time + chunk_delta
@@ -151,17 +168,24 @@ def main():
         query = f'SELECT * INTO {qualified_target} FROM "{source_measurement}" WHERE time >= \'{t1}\' AND time < \'{t2}\' GROUP BY *'
 
         chunk_count += 1
-        percentage = (chunk_count / total_chunks) * 100
-        logger.info(f"[{chunk_count}/{total_chunks}] ({percentage:.1f}%) Processing time range: {t1} -> {t2}")
 
         max_retries = 3
         retry_delay = 2 # seconds
         success = False
+        points_in_chunk = 0
 
         for attempt in range(1, max_retries + 1):
             try:
                 # Execute the query (requires POST for INTO queries)
                 result = client.query(query, method='POST')
+
+                # InfluxDB SELECT INTO returns a single series with a "written" field
+                # e.g. [{'time': '1970-01-01T00:00:00Z', 'written': 150}]
+                written_points = list(result.get_points())
+                if written_points and 'written' in written_points[0]:
+                    points_in_chunk = written_points[0]['written']
+
+                total_points_written += points_in_chunk
                 success = True
                 break
             except (InfluxDBServerError, InfluxDBClientError) as e:
@@ -182,9 +206,24 @@ def main():
             logger.error("Aborting to ensure no data is missing. Please investigate and resume from this chunk.")
             sys.exit(1)
 
+        # Log progress periodically (e.g. every 5% of chunks, or at least every 10 chunks if few chunks)
+        # Always log the first and last chunk
+        log_interval = max(1, int(total_chunks * 0.05))
+        if chunk_count == 1 or chunk_count == total_chunks or chunk_count % log_interval == 0:
+            percentage = (chunk_count / total_chunks) * 100
+
+            if initial_source_count is not None and initial_source_count > 0:
+                points_remaining = max(0, initial_source_count - total_points_written)
+                logger.info(f"Progress: [{chunk_count}/{total_chunks}] chunks ({percentage:.1f}%) | "
+                            f"Copied {total_points_written:,} points | Remaining: ~{points_remaining:,}")
+            else:
+                logger.info(f"Progress: [{chunk_count}/{total_chunks}] chunks ({percentage:.1f}%) | "
+                            f"Copied {total_points_written:,} points")
+
         current_time = next_time
 
     logger.info("Backup process finished!")
+    logger.info(f"Total points written across all chunks: {total_points_written:,}")
 
     # Final verification
     if initial_source_count is not None and initial_source_count > 0:
