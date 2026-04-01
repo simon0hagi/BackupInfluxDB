@@ -220,6 +220,7 @@ def main():
         logger.info(f"Will process up to {max_chunks_per_run} chunks this run.")
 
     chunks_processed_this_run = 0
+    run_start_time = time.time()
 
     def process_chunk(t1_str, t2_str):
         """Worker function to execute a single chunk query."""
@@ -330,9 +331,14 @@ def main():
         # We don't advance the state file, so the next run will correctly retry the interrupted batch.
         sys.exit(0)
 
+    run_end_time = time.time()
+    elapsed_seconds = run_end_time - run_start_time
+    elapsed_timedelta = timedelta(seconds=int(elapsed_seconds))
+
     if current_time >= end_time:
         logger.info("Backup process finished entirely!")
-        logger.info(f"Total points written across all chunks: {total_points_written:,}")
+        logger.info(f"Total points written: {total_points_written:,}")
+        logger.info(f"Time taken for this run: {elapsed_timedelta}")
         clear_state()
 
         # Final verification
@@ -352,7 +358,9 @@ def main():
             else:
                  logger.info("Data was copied, but could not automatically verify target point count.")
     else:
-        logger.info(f"Backup paused at {current_time.isoformat()}. Run the script again to resume.")
+        logger.info(f"Backup paused at {current_time.isoformat()}.")
+        logger.info(f"Time taken for this run: {elapsed_timedelta}")
+        logger.info("Run the script again to resume.")
 
 if __name__ == "__main__":
     main()
