@@ -284,10 +284,14 @@ def main():
                     mask = pd.Series(True, index=points_df.index)
                     for k, v in index_dict.items():
                         if k in points_df.columns:
-                            mask &= (points_df[k] == v)
+                            # A row matches if its value for column k exactly matches the configured value v,
+                            # OR if the value in the dataframe is missing (NaN/None), acting as a wildcard
+                            # to tolerate incomplete tag sets in InfluxDB points.
+                            mask &= ((points_df[k] == v) | points_df[k].isna())
                         else:
-                            mask = pd.Series(False, index=points_df.index)
-                            break
+                            # If the column is entirely missing from the chunk, it's effectively NaN for all rows.
+                            # So it acts as a wildcard and does not fail the match.
+                            pass
 
                     mask = mask & points_df[req_valname].notna()
 
