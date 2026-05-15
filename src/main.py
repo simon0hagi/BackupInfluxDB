@@ -6,9 +6,18 @@ import json
 import logging
 import concurrent.futures
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import pandas as pd
+
 from influxdb import InfluxDBClient
 from influxdb.exceptions import InfluxDBClientError, InfluxDBServerError
 from dotenv import load_dotenv
+
+from constants import TAGLIST_PATH
+from file_loader import get_uid_for_tagset
+
+env_path = Path(__file__).resolve().parent.parent / '.env'
+load_dotenv(dotenv_path=env_path)
 
 # Configure logging
 logging.basicConfig(
@@ -17,6 +26,8 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger(__name__)
+
+#uids = get_uid_for_tagset(TAGLIST_PATH)
 
 def parse_iso_time(time_str):
     # Handle 'Z' suffix for UTC which fromisoformat might not handle in older Pythons
@@ -82,15 +93,22 @@ def main():
     load_dotenv()
 
     # Read environment variables
-    host = os.environ.get('INFLUXDB_HOST', 'localhost')
-    port = int(os.environ.get('INFLUXDB_PORT', '8086'))
-    user = os.environ.get('INFLUXDB_USER', '')
-    password = os.environ.get('INFLUXDB_PASSWORD', '')
-    database = get_env_or_die('INFLUXDB_DATABASE')
-    target_database = os.environ.get('TARGET_DATABASE', database)
+    source_host = os.environ.get('SOURCE_INFLUXDB_HOST')
+    target_host = os.environ.get('TARGET_INFLUXDB_HOST')
+
+    source_port = int(os.environ.get('SOURCE_INFLUXDB_PORT'))
+    target_port = int(os.environ.get('TARGET_INFLUXDB_PORT'))
+
+    source_token = os.environ.get('SOURCE_INFLUXDB_TOKEN', '')
+    target_token = os.environ.get('TARGET_INFLUXDB_TOKEN', '')
+
+    source_database = get_env_or_die('SOURCE_DATABASE')
+    target_database = os.environ.get('TARGET_DATABASE')
 
     source_measurement = get_env_or_die('SOURCE_MEASUREMENT')
     target_measurement = get_env_or_die('TARGET_MEASUREMENT')
+
+    taglist_file = Path.cwd().parent / "config" / get_env_or_die('TAGLIST_FILE')
 
     start_time_str = get_env_or_die('START_TIME')
     end_time_str = get_env_or_die('END_TIME')
@@ -129,39 +147,50 @@ def main():
         logger.error("START_TIME must be before END_TIME.")
         sys.exit(1)
 
+    #Build inverted index for UIDs for quick lookup in taglist
+    logger.info(f"Loading tags from {taglist_file} and building UID index...")
+    uid_index = get_uid_for_tagset(taglist_file)
+    logger.info(f"Built UID index with {len(uid_index)} entries.")
+
+
     # Initialize InfluxDB Client
-    client = InfluxDBClient(host=host, port=port, username=user, password=password, database=database)
+    source_client = InfluxDBClient(host=source_host, port=source_port, database=source_database, ssl=True, verify_ssl=True, headers={"Authorization": f"Bearer {source_token}"})
+    target_client = InfluxDBClient(host=target_host, port=target_port, database=target_database, ssl=True, verify_ssl=True, headers={"Authorization": f"Bearer {target_token}"})
 
-    logger.info(f"Connecting to InfluxDB at {host}:{port}, database '{database}'...")
+    # test source connection
+    logger.info(f"Connecting to InfluxDB at {source_host}:{source_port}, source_database '{source_database}'...")
     try:
-        # Test connection
-        client.ping()
-        logger.info("Successfully connected to InfluxDB.")
+        source_client.ping()
+        logger.info("Successfully connected to source InfluxDB.")
+    except Exception as e:
+        logger.error(f"Failed to connect to InfluxDB or verify databases: {e}")
+        sys.exit(1)
 
-        # Verify target database exists if it's different
-        if target_database != database:
-            dbs = client.get_list_database()
-            if not any(db['name'] == target_database for db in dbs):
-                logger.error(f"Target database '{target_database}' does not exist. Please create it first.")
-                sys.exit(1)
+    # test target connection
+    logger.info(f"Connecting to InfluxDB at {target_host}:{target_port}, target_database '{target_database}'...")
+    try:
+        target_client.ping()
+        logger.info("Successfully connected to target InfluxDB.")
     except Exception as e:
         logger.error(f"Failed to connect to InfluxDB or verify databases: {e}")
         sys.exit(1)
 
     logger.info("--- Configuration Summary ---")
-    logger.info(f"Source: Database '{database}', Measurement '{source_measurement}'")
+    logger.info(f"Source: Database '{source_database}', Measurement '{source_measurement}'")
     logger.info(f"Target: Database '{target_database}', Measurement '{target_measurement}'")
     logger.info(f"Time Range: {start_time.isoformat()} to {end_time.isoformat()}")
     logger.info(f"Chunk Interval: {chunk_interval_minutes} minute(s)")
+    logger.info(f"Max Concurrent Queries: {max_concurrent_queries}")
+    logger.info(f"Max Chunks Per Run: {max_chunks_per_run if max_chunks_per_run is not None else 'No limit'}")
     logger.info("-----------------------------")
 
     # Analyze data before starting
     logger.info("Analyzing source measurement data...")
 
     # Show an example line
-    example_query = f'SELECT * FROM "{database}".."{source_measurement}" LIMIT 1'
+    example_query = f'SELECT * FROM "{source_database}".."{source_measurement}" LIMIT 1'
     try:
-        example_result = client.query(example_query, method='GET')
+        example_result = source_client.query(example_query, method='GET')
         points = list(example_result.get_points())
         if points:
             logger.info("Example data point from source:")
@@ -171,7 +200,7 @@ def main():
     except Exception as e:
         logger.warning(f"Could not fetch example data point: {e}")
 
-    initial_source_count = count_measurement_points(client, database, source_measurement, start_time, end_time)
+    initial_source_count = count_measurement_points(source_client, source_database, source_measurement, start_time, end_time)
 
     if initial_source_count is not None:
         if initial_source_count == 0:
@@ -190,7 +219,7 @@ def main():
     state = load_state()
     if state:
         # Verify the state matches our current config to avoid resuming a different backup
-        if (state.get('database') == database and
+        if (state.get('source_database') == source_database and
             state.get('source_measurement') == source_measurement and
             state.get('target_measurement') == target_measurement):
 
@@ -215,35 +244,85 @@ def main():
         total_chunks = 1
 
     logger.info(f"Starting backup process. Total chunks in range: {total_chunks}")
-    logger.info(f"Concurrency level: {max_concurrent_queries} queries simultaneously.")
-    if max_chunks_per_run:
-        logger.info(f"Will process up to {max_chunks_per_run} chunks this run.")
 
     chunks_processed_this_run = 0
     run_start_time = time.time()
 
     def process_chunk(t1_str, t2_str):
         """Worker function to execute a single chunk query."""
-        # Fully qualify target measurement to allow cross-database copying.
-        qualified_target = f'"{target_database}".."{target_measurement}"'
-        query = f'SELECT * INTO {qualified_target} FROM "{source_measurement}" WHERE time >= \'{t1_str}\' AND time < \'{t2_str}\' GROUP BY *'
+        # Fully qualify target measurement to allow cross-source_database copying.
+        query_read = f'SELECT * FROM "{source_database}".."{source_measurement}" WHERE time >= \'{t1_str}\' AND time < \'{t2_str}\''
 
-        max_retries = 3
+        max_retries = 5
         retry_delay = 2 # seconds
 
         for attempt in range(1, max_retries + 1):
             try:
-                # Execute the query (requires POST for INTO queries)
-                result = client.query(query, method='POST')
+                # 1. Read data
+                result = source_client.query(query_read, method='GET')
+                points = list(result.get_points())
 
-                # Extract written points count
-                written_points = list(result.get_points())
-                if written_points and 'written' in written_points[0]:
-                    return written_points[0]['written']
+                if not points:
+                    return 0
+
+                # 2. Process data with pandas
+                points_df = pd.DataFrame(points)
+                if points_df.empty:
+                    return 0
+
+                new_points_batch = []
+
+                times = points_df.pop('time')
+
+                for index_key_tuple, uid in uid_index.items():
+                    index_dict = dict(index_key_tuple)
+                    req_valname = index_dict.pop('__valname__')
+
+                    if req_valname not in points_df.columns:
+                        continue
+
+                    mask = pd.Series(True, index=points_df.index)
+                    for k, v in index_dict.items():
+                        if k in points_df.columns:
+                            mask &= (points_df[k] == v)
+                        else:
+                            mask = pd.Series(False, index=points_df.index)
+                            break
+
+                    mask = mask & points_df[req_valname].notna()
+
+                    # Process the matched rows in mask
+                    if mask.any():
+                        matched_df = points_df[mask]
+
+                        for idx, row in matched_df.iterrows():
+                            non_null_row = row.dropna().to_dict()
+                            field_val = non_null_row.pop(req_valname)
+
+                            tags = {k: str(v) for k, v in non_null_row.items() if isinstance(v, str)}
+                            tags['UID'] = uid
+
+                            new_point = {
+                                "measurement": target_measurement,
+                                "time": times[idx],
+                                "tags": tags,
+                                "fields": {
+                                    req_valname: field_val
+                                }
+                            }
+                            new_points_batch.append(new_point)
+
+                            points_df.at[idx, req_valname] = pd.NA
+
+                # 3. Write to target
+                if new_points_batch:
+                    target_client.write_points(new_points_batch, database=target_database, batch_size=5000)
+                    return len(new_points_batch)
                 return 0
+
             except (InfluxDBServerError, InfluxDBClientError) as e:
                 logger.warning(f"Chunk {t1_str}->{t2_str} attempt {attempt} failed: {e}")
-                if attempt < max_retries:
+                if attempt < max_retries:                                                                       #ToDo: Write 906 in 668 instead of 906
                     time.sleep(retry_delay)
                     retry_delay *= 2
             except Exception as e:
@@ -251,6 +330,7 @@ def main():
                 if attempt < max_retries:
                     time.sleep(retry_delay)
                     retry_delay *= 2
+
 
         logger.error(f"Failed to process chunk {t1_str} -> {t2_str} after {max_retries} attempts.")
         raise RuntimeError(f"Chunk failure: {t1_str} -> {t2_str}")
@@ -303,7 +383,7 @@ def main():
                 current_time = batch_end_time
 
                 # Log progress periodically
-                log_interval = max(1, int(total_chunks * 0.05))
+                log_interval = max(1, int(total_chunks * 0.001))
                 if chunk_count == len(batch_tasks) or chunk_count == total_chunks or chunk_count % log_interval < max_concurrent_queries:
                     percentage = (chunk_count / total_chunks) * 100
 
@@ -320,7 +400,7 @@ def main():
                     'current_time': current_time.isoformat(),
                     'chunk_count': chunk_count,
                     'total_points_written': total_points_written,
-                    'database': database,
+                    'source_database': source_database,
                     'source_measurement': source_measurement,
                     'target_measurement': target_measurement
                 })
@@ -337,14 +417,14 @@ def main():
 
     if current_time >= end_time:
         logger.info("Backup process finished entirely!")
-        logger.info(f"Total points written: {total_points_written:,}")
+        logger.info(f"Total points written across all chunks: {total_points_written:,}")
         logger.info(f"Time taken for this run: {elapsed_timedelta}")
         clear_state()
 
         # Final verification
         if initial_source_count is not None and initial_source_count > 0:
             logger.info("Verifying copied data...")
-            final_target_count = count_measurement_points(client, target_database, target_measurement, start_time, end_time)
+            final_target_count = count_measurement_points(source_client, target_database, target_measurement, start_time, end_time)
 
             if final_target_count is not None:
                 logger.info("--- Final Summary ---")
@@ -358,9 +438,8 @@ def main():
             else:
                  logger.info("Data was copied, but could not automatically verify target point count.")
     else:
-        logger.info(f"Backup paused at {current_time.isoformat()}.")
+        logger.info(f"Backup paused at {current_time.isoformat()}. Run the script again to resume.")
         logger.info(f"Time taken for this run: {elapsed_timedelta}")
-        logger.info("Run the script again to resume.")
 
 if __name__ == "__main__":
     main()
