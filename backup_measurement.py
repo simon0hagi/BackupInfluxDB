@@ -5,10 +5,13 @@ import math
 import json
 import logging
 import concurrent.futures
+import pandas as pd
 from datetime import datetime, timedelta, timezone
 from influxdb import InfluxDBClient
 from influxdb.exceptions import InfluxDBClientError, InfluxDBServerError
 from dotenv import load_dotenv
+
+import file_loader
 
 # Configure logging
 logging.basicConfig(
@@ -91,6 +94,7 @@ def main():
 
     source_measurement = get_env_or_die('SOURCE_MEASUREMENT')
     target_measurement = get_env_or_die('TARGET_MEASUREMENT')
+    taglist_file = get_env_or_die('TAGLIST_FILE')
 
     start_time_str = get_env_or_die('START_TIME')
     end_time_str = get_env_or_die('END_TIME')
@@ -128,6 +132,32 @@ def main():
     if start_time >= end_time:
         logger.error("START_TIME must be before END_TIME.")
         sys.exit(1)
+
+    # Build inverted index for UIDs
+    logger.info(f"Loading tags from {taglist_file} and building UID index...")
+    tags_dict = file_loader.get_tags_from_taglist(taglist_file)
+
+    uid_index = {}
+    for tag_key, tag_data in tags_dict.items():
+        if 'UID' not in tag_data:
+            continue
+
+        uid = tag_data['UID']
+        valname = tag_data.get('valname', 'value') # Default to 'value' if not specified
+
+        # Build the tuple key for matching
+        # Sort keys to ensure consistent tuple generation
+        match_criteria = {}
+        for k, v in tag_data.items():
+            if k not in ('UID', 'measurement', 'valname'):
+                match_criteria[k] = v
+
+        # We need a hashable key for the dictionary. A tuple of sorted items works well.
+        # Include valname in the key because the same tags might have different UIDs for different fields.
+        key_tuple = tuple(sorted(match_criteria.items())) + (('__valname__', valname),)
+        uid_index[key_tuple] = uid
+
+    logger.info(f"Built UID index with {len(uid_index)} entries.")
 
     # Initialize InfluxDB Client
     client = InfluxDBClient(host=host, port=port, username=user, password=password, database=database)
@@ -223,24 +253,112 @@ def main():
     run_start_time = time.time()
 
     def process_chunk(t1_str, t2_str):
-        """Worker function to execute a single chunk query."""
-        # Fully qualify target measurement to allow cross-database copying.
-        qualified_target = f'"{target_database}".."{target_measurement}"'
-        query = f'SELECT * INTO {qualified_target} FROM "{source_measurement}" WHERE time >= \'{t1_str}\' AND time < \'{t2_str}\' GROUP BY *'
+        """Worker function to execute a single chunk query and rewrite points with UIDs."""
+        query = f'SELECT * FROM "{source_measurement}" WHERE time >= \'{t1_str}\' AND time < \'{t2_str}\''
 
         max_retries = 3
         retry_delay = 2 # seconds
 
         for attempt in range(1, max_retries + 1):
             try:
-                # Execute the query (requires POST for INTO queries)
-                result = client.query(query, method='POST')
+                # 1. Read data
+                result = client.query(query, method='GET')
+                points = list(result.get_points())
 
-                # Extract written points count
-                written_points = list(result.get_points())
-                if written_points and 'written' in written_points[0]:
-                    return written_points[0]['written']
+                if not points:
+                    return 0
+
+                # 2. Process data using pandas
+                df = pd.DataFrame(points)
+                if df.empty:
+                    return 0
+
+                new_points_batch = []
+
+                # We need to map row by row based on our index.
+                # To do this efficiently, we can separate potential tags (string columns) from fields (numeric columns)
+
+                # Get the 'time' column
+                times = df.pop('time')
+
+                # In standard pandas we can process rows iteratively, but a vectorized approach is better
+                # The challenge is that our uid_index matches specific tag combinations + a field name.
+                # Since the index is relatively small compared to points, we can apply masks per index entry.
+
+                # Convert the dataframe to have all potential fields processed
+                for index_key_tuple, uid in uid_index.items():
+                    index_dict = dict(index_key_tuple)
+                    req_valname = index_dict.pop('__valname__')
+
+                    if req_valname not in df.columns:
+                        continue
+
+                    # Create a boolean mask for rows that match all required tags in this index entry
+                    mask = pd.Series(True, index=df.index)
+                    for k, v in index_dict.items():
+                        if k in df.columns:
+                            # Handling NaN comparisons correctly in pandas for strings
+                            mask = mask & (df[k] == v)
+                        else:
+                            mask = pd.Series(False, index=df.index)
+                            break
+
+                    # Also need to make sure the specific field is not null
+                    mask = mask & df[req_valname].notna()
+
+                    # Process the matched rows
+                    if mask.any():
+                        matched_df = df[mask]
+
+                        # Identify tag columns vs field columns for this subset
+                        # Tags are all columns that are objects/strings, except the req_valname if it's a string
+                        # Actually we can just keep all non-null object columns as tags and the req_valname as the only field
+
+                        for idx, row in matched_df.iterrows():
+                            # Extract all non-null values
+                            non_null_row = row.dropna().to_dict()
+                            field_val = non_null_row.pop(req_valname)
+
+                            # Remaining strings are treated as tags
+                            tags = {k: str(v) for k, v in non_null_row.items() if isinstance(v, str)}
+                            tags['UID'] = uid
+
+                            new_point = {
+                                "measurement": target_measurement,
+                                "time": times[idx],
+                                "tags": tags,
+                                "fields": {
+                                    req_valname: field_val
+                                }
+                            }
+                            new_points_batch.append(new_point)
+
+                            # Remove the matched field from the row so it's not processed again in fallback
+                            df.at[idx, req_valname] = pd.NA
+
+                # Fallback: Process any remaining non-null fields that didn't match an index
+                # (This logic maintains backward compatibility for data without UIDs)
+                for idx, row in df.iterrows():
+                    non_null_row = row.dropna().to_dict()
+                    if non_null_row:
+                        tags = {k: str(v) for k, v in non_null_row.items() if isinstance(v, str)}
+                        fields = {k: v for k, v in non_null_row.items() if not isinstance(v, str)}
+                        if fields:
+                            new_point = {
+                                "measurement": target_measurement,
+                                "time": times[idx],
+                                "tags": tags,
+                                "fields": fields
+                            }
+                            new_points_batch.append(new_point)
+
+                # 3. Write data
+                if new_points_batch:
+                    # Write points to target database
+                    client.write_points(new_points_batch, database=target_database, batch_size=10000)
+                    return len(new_points_batch)
                 return 0
+
             except (InfluxDBServerError, InfluxDBClientError) as e:
                 logger.warning(f"Chunk {t1_str}->{t2_str} attempt {attempt} failed: {e}")
                 if attempt < max_retries:
