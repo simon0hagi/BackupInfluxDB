@@ -159,11 +159,6 @@ async def async_main():
     source_client = InfluxDBClient(host=source_host, port=source_port, database=source_database, ssl=True, verify_ssl=True, headers={"Authorization": f"Bearer {source_token}"})
     target_client = InfluxDBClient(host=target_host, port=target_port, database=target_database, ssl=True, verify_ssl=True, headers={"Authorization": f"Bearer {target_token}"})
 
-    # Create async clients
-    async_source_client = AsyncInfluxDBClient(host=source_host, port=source_port, db=source_database, ssl=True, headers={"Authorization": f"Bearer {source_token}"})
-    async_target_client = AsyncInfluxDBClient(host=target_host, port=target_port, db=target_database, ssl=True, headers={"Authorization": f"Bearer {target_token}"})
-
-
     # test source connection
     logger.info(f"Connecting to InfluxDB at {source_host}:{source_port}, source_database '{source_database}'...")
     try:
@@ -255,7 +250,7 @@ async def async_main():
     chunks_processed_this_run = 0
     run_start_time = time.time()
 
-    async def process_chunk(t1_str, t2_str):
+    def process_chunk(t1_str, t2_str):
         """Worker function to execute a single chunk query."""
         # Fully qualify target measurement to allow cross-source_database copying.
         query_read = f'SELECT * FROM "{source_database}".."{source_measurement}" WHERE time >= \'{t1_str}\' AND time < \'{t2_str}\''
@@ -266,16 +261,8 @@ async def async_main():
         for attempt in range(1, max_retries + 1):
             try:
                 # 1. Read data
-                result = await async_source_client.query(query_read)
-                points = []
-                if 'results' in result and result['results']:
-                    for r in result['results']:
-                        if 'series' in r:
-                            for s in r['series']:
-                                cols = s.get('columns', [])
-                                vals = s.get('values', [])
-                                for v in vals:
-                                    points.append(dict(zip(cols, v)))
+                result = source_client.query(query_read, method='GET')
+                points = list(result.get_points())
 
                 if not points:
                     return 0
@@ -349,19 +336,19 @@ async def async_main():
 
                 # 3. Write to target
                 if new_points_batch:
-                    await async_target_client.write(new_points_batch)
+                    target_client.write_points(new_points_batch, database=target_database, batch_size=5000)
                     return len(new_points_batch)
                 return 0
 
             except (InfluxDBServerError, InfluxDBClientError) as e:
                 logger.warning(f"Chunk {t1_str}->{t2_str} attempt {attempt} failed: {e}")
                 if attempt < max_retries:                                                                       #ToDo: Write 906 in 668 instead of 906
-                    await asyncio.sleep(retry_delay)
+                    time.sleep(retry_delay)
                     retry_delay *= 2
             except Exception as e:
                 logger.error(f"Unexpected error on chunk {t1_str}->{t2_str}: {e}")
                 if attempt < max_retries:
-                    await asyncio.sleep(retry_delay)
+                    time.sleep(retry_delay)
                     retry_delay *= 2
 
 
@@ -371,7 +358,7 @@ async def async_main():
     try:
         # We process in batches equal to max_concurrent_queries.
         # This keeps state saving robust—we only advance the state when a full batch is safely completed.
-        async with async_source_client, async_target_client:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrent_queries) as executor:
             while current_time < end_time:
                 if max_chunks_per_run and chunks_processed_this_run >= max_chunks_per_run:
                     logger.info(f"Reached MAX_CHUNKS_PER_RUN limit of {max_chunks_per_run}. Pausing.")
@@ -394,8 +381,8 @@ async def async_main():
                     t1 = batch_end_time.isoformat().replace('+00:00', 'Z')
                     t2 = next_time.isoformat().replace('+00:00', 'Z')
 
-                    task = asyncio.create_task(process_chunk(t1, t2))
-                    batch_tasks.append(task)
+                    future = executor.submit(process_chunk, t1, t2)
+                    batch_tasks.append(future)
                     batch_end_time = next_time
 
                 if not batch_tasks:
@@ -403,8 +390,8 @@ async def async_main():
 
                 # Wait for the current batch to finish
                 try:
-                    results = await asyncio.gather(*batch_tasks)
-                    for points_in_chunk in results:
+                    for future in concurrent.futures.as_completed(batch_tasks):
+                        points_in_chunk = future.result()
                         total_points_written += points_in_chunk
                         chunk_count += 1
                         chunks_processed_this_run += 1

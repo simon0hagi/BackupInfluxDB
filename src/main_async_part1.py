@@ -356,12 +356,12 @@ async def async_main():
             except (InfluxDBServerError, InfluxDBClientError) as e:
                 logger.warning(f"Chunk {t1_str}->{t2_str} attempt {attempt} failed: {e}")
                 if attempt < max_retries:                                                                       #ToDo: Write 906 in 668 instead of 906
-                    await asyncio.sleep(retry_delay)
+                    time.sleep(retry_delay)
                     retry_delay *= 2
             except Exception as e:
                 logger.error(f"Unexpected error on chunk {t1_str}->{t2_str}: {e}")
                 if attempt < max_retries:
-                    await asyncio.sleep(retry_delay)
+                    time.sleep(retry_delay)
                     retry_delay *= 2
 
 
@@ -371,7 +371,7 @@ async def async_main():
     try:
         # We process in batches equal to max_concurrent_queries.
         # This keeps state saving robust—we only advance the state when a full batch is safely completed.
-        async with async_source_client, async_target_client:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrent_queries) as executor:
             while current_time < end_time:
                 if max_chunks_per_run and chunks_processed_this_run >= max_chunks_per_run:
                     logger.info(f"Reached MAX_CHUNKS_PER_RUN limit of {max_chunks_per_run}. Pausing.")
@@ -394,8 +394,8 @@ async def async_main():
                     t1 = batch_end_time.isoformat().replace('+00:00', 'Z')
                     t2 = next_time.isoformat().replace('+00:00', 'Z')
 
-                    task = asyncio.create_task(process_chunk(t1, t2))
-                    batch_tasks.append(task)
+                    future = executor.submit(process_chunk, t1, t2)
+                    batch_tasks.append(future)
                     batch_end_time = next_time
 
                 if not batch_tasks:
@@ -403,8 +403,8 @@ async def async_main():
 
                 # Wait for the current batch to finish
                 try:
-                    results = await asyncio.gather(*batch_tasks)
-                    for points_in_chunk in results:
+                    for future in concurrent.futures.as_completed(batch_tasks):
+                        points_in_chunk = future.result()
                         total_points_written += points_in_chunk
                         chunk_count += 1
                         chunks_processed_this_run += 1
