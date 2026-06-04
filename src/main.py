@@ -416,7 +416,7 @@ async def async_main():
                 current_time = batch_end_time
 
                 # Log progress periodically
-                log_interval = max(1, int(total_chunks * 0.001))
+                log_interval = max(1, int(total_chunks * 0.05)) # Log roughly every 5% instead of 0.1% to avoid spam but guarantee output
                 if chunk_count == len(batch_tasks) or chunk_count == total_chunks or chunk_count % log_interval < max_concurrent_queries:
                     percentage = (chunk_count / total_chunks) * 100
 
@@ -427,6 +427,9 @@ async def async_main():
                     else:
                         logger.info(f"Progress: [{chunk_count}/{total_chunks}] chunks ({percentage:.1f}%) | "
                                     f"Copied {total_points_written:,} points")
+                else:
+                    # Debug print to ensure user knows it's doing something if they get anxious
+                    print(f"Processed batch ending at {batch_end_time.isoformat()}...", end="\r", flush=True)
 
                 # Save state after successful batch
                 save_state({
